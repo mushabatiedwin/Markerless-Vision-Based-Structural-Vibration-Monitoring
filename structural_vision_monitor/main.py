@@ -7,6 +7,8 @@ from signal_analysis import smooth_signal, compute_fft, highpass_filter
 from calibration import pixel_to_mm
 from utils import save_plot
 from signal_analysis import dominant_frequency
+from signal_analysis import estimate_damping
+
 
 # ---------------- SETTINGS ----------------
 video_path = "data/test_video.mp4"
@@ -40,9 +42,16 @@ plt.ylabel("Displacement")
 plt.savefig(os.path.join(results_dir, "displacement.png"))
 plt.close()
 
+start_frame = 210   # adjust slightly if needed
+end_frame = 400
 
+ringing_segment = physical_signal[start_frame:end_frame]
 
-frequencies, magnitudes = compute_fft(physical_signal, fps)
+damping = estimate_damping(ringing_segment)
+print(f"Estimated Damping Ratio: {damping}")
+
+frequencies, magnitudes = compute_fft(ringing_segment, fps)
+
 # --- Get dominant frequency ---
 dom_freq, dom_mag = dominant_frequency(frequencies, magnitudes)
 print(f"Dominant Frequency: {dom_freq:.2f} Hz")
@@ -60,5 +69,7 @@ plt.ylabel("Magnitude")
 plt.xlim(0, 20)
 plt.savefig(os.path.join(results_dir, "fft.png"))
 plt.close()
+
+
 
 print("Processing complete. Results saved in /results.")
