@@ -1,3 +1,5 @@
+uvicorn api:app --reload
+
 python -m pip install numpy
 python -m pip install opencv-python
 python main.py
@@ -9,6 +11,12 @@ python main.py
     calibration.py
     signal_analysis.py
     utils.py
+    api.py                 ← FastAPI server
+    live_processor.py      ← webcam + signal pipeline
+    /templates
+        index.html
+    /static
+        style.css
     /data
 	test_video.mp4
     /results
@@ -29,3 +37,13 @@ Subpixel refinement validation
 Error quantification
 
 Ground truth comparison
+
+
+
+A vibration analysis engine
+
+Signal processing
+
+Damping estimation
+
+Frequency extraction
