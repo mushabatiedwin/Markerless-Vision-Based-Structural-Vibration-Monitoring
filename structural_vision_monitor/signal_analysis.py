@@ -20,3 +20,16 @@ def compute_fft(signal, fps):
 def dominant_frequency(frequencies, magnitudes):
     idx = np.argmax(magnitudes)
     return frequencies[idx], magnitudes[idx]
+
+def estimate_damping(signal):
+    peaks = []
+    for i in range(1, len(signal)-1):
+        if signal[i] > signal[i-1] and signal[i] > signal[i+1]:
+            peaks.append(signal[i])
+
+    if len(peaks) < 2:
+        return None
+
+    delta = np.log(peaks[0] / peaks[1])
+    zeta = delta / np.sqrt(4*np.pi**2 + delta**2)
+    return zeta
