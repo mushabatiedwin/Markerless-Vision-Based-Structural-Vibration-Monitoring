@@ -1,0 +1,31 @@
+python -m pip install numpy
+python -m pip install opencv-python
+python main.py
+
+/structural_vision_monitor
+    main.py
+    feature_tracker.py
+    motion_compensation.py
+    calibration.py
+    signal_analysis.py
+    utils.py
+    /data
+	test_video.mp4
+    /results
+
+
+You have implemented:
+
+A markerless, non-deep-learning, optical-flow-based structural vibration monitoring system with drift compensation and frequency domain analysis.
+
+You do not yet have:
+
+Proper background segmentation
+
+Robust camera motion estimation via homography
+
+Subpixel refinement validation
+
+Error quantification
+
+Ground truth comparison
