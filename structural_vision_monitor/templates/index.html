@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Structural Vision Monitor</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+
+<h1>Structural Vision Monitor</h1>
+
+<div class="metrics">
+    <div>
+        <h2>Dominant Frequency</h2>
+        <p id="freq">0 Hz</p>
+    </div>
+
+    <div>
+        <h2>Damping Ratio</h2>
+        <p id="damping">0</p>
+    </div>
+
+    <div>
+        <h2>System Health</h2>
+        <p id="status">Initializing</p>
+    </div>
+</div>
+
+<canvas id="freqChart"></canvas>
+
+<script>
+const ctx = document.getElementById('freqChart');
+const chart = new Chart(ctx, {
+    type: 'line',
+    data: {
+        labels: [],
+        datasets: [{
+            label: 'Frequency (Hz)',
+            data: [],
+            borderColor: 'cyan'
+        }]
+    }
+});
+
+async function updateData() {
+    const response = await fetch('/metrics');
+    const data = await response.json();
+
+    document.getElementById('freq').innerText = data.frequency + " Hz";
+    document.getElementById('damping').innerText = data.damping;
+    document.getElementById('status').innerText = data.status;
+
+    chart.data.labels.push('');
+    chart.data.datasets[0].data.push(data.frequency);
+
+    if(chart.data.labels.length > 20){
+        chart.data.labels.shift();
+        chart.data.datasets[0].data.shift();
+    }
+
+    chart.update();
+}
+
+setInterval(updateData, 1000);
+</script>
+
+</body>
+</html>

@@ -1,0 +1,18 @@
+body {
+    background: #111;
+    color: white;
+    font-family: Arial;
+    text-align: center;
+}
+
+.metrics {
+    display: flex;
+    justify-content: space-around;
+    margin: 30px;
+}
+
+.metrics div {
+    background: #222;
+    padding: 20px;
+    border-radius: 10px;
+}
