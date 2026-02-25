@@ -214,3 +214,63 @@ def signal_snr(signal):
 def rms_displacement(signal):
     """Root-mean-square displacement amplitude."""
     return float(np.sqrt(np.mean(signal ** 2)))
+
+
+# ---------------------------------------------------------------------------
+# Additional spectral analysis for damage and event detection
+# ---------------------------------------------------------------------------
+
+def extract_spectral_peaks(frequencies, magnitudes, n=5, min_hz=0.5, min_prominence=0.05):
+    """
+    Extract top N spectral peaks with quality metrics (Q-factor, bandwidth).
+    Used by damage detection to assess spectral sharpness.
+
+    Returns
+    -------
+    list of dicts with keys: frequency, magnitude, q_factor, bandwidth
+    """
+    mask = frequencies >= min_hz
+    f = frequencies[mask]
+    m = magnitudes[mask]
+
+    peak_indices, props = find_peaks(m, prominence=min_prominence * np.max(m))
+    if len(peak_indices) == 0:
+        return []
+
+    ranked = sorted(
+        zip(f[peak_indices], m[peak_indices]),
+        key=lambda x: -x[1]
+    )[:n]
+
+    peaks = []
+    for freq, mag in ranked:
+        # Find corresponding index
+        idx = np.argmin(np.abs(f - freq))
+        
+        # Q-factor: center frequency / -3dB bandwidth
+        peak_height = m[idx]
+        half_height = peak_height / 2.0
+
+        left = idx
+        for i in range(idx - 1, -1, -1):
+            if m[i] < half_height:
+                left = i
+                break
+
+        right = idx
+        for i in range(idx + 1, len(m)):
+            if m[i] < half_height:
+                right = i
+                break
+
+        bw = abs(f[right] - f[left]) if right > left else 1.0
+        q = freq / max(bw, 0.1)
+
+        peaks.append({
+            "frequency": float(freq),
+            "magnitude": float(mag),
+            "q_factor": float(q),
+            "bandwidth": float(bw)
+        })
+
+    return peaks
