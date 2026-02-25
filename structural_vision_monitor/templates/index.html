@@ -3,64 +3,144 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Structural Vision Monitor</title>
+  <title>Structural Vision Monitor — Advanced</title>
   <link rel="stylesheet" href="/static/style.css">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 <body>
 
 <header>
-  <div class="logo">⚙ Structural Vision Monitor</div>
+  <div class="logo">⚙ Structural Vision Monitor (Advanced)</div>
   <div id="connection-status" class="badge badge-init">Connecting…</div>
 </header>
 
 <main>
 
-  <!-- Camera feed -->
+  <!-- Camera Feed -->
   <section class="card video-card">
     <h2>Live Feed</h2>
     <img id="video-feed" src="/video_feed" alt="Camera feed" />
   </section>
 
-  <!-- Metric tiles -->
+  <!-- Core Metrics -->
   <section class="metrics-grid">
     <div class="metric-card">
       <span class="metric-label">Dominant Frequency</span>
       <span class="metric-value" id="freq">—</span>
       <span class="metric-unit">Hz</span>
+      <span class="metric-confidence" id="freq-conf"></span>
     </div>
     <div class="metric-card">
       <span class="metric-label">Damping Ratio ζ</span>
       <span class="metric-value" id="damping">—</span>
       <span class="metric-unit"></span>
+      <span class="metric-confidence" id="damp-conf"></span>
     </div>
     <div class="metric-card">
       <span class="metric-label">RMS Displacement</span>
       <span class="metric-value" id="rms">—</span>
       <span class="metric-unit">px</span>
+      <span class="metric-confidence" id="rms-conf"></span>
     </div>
-    <div class="metric-card status-card">
+    <div class="metric-card">
       <span class="metric-label">System Health</span>
       <span class="metric-value" id="status">—</span>
+      <span class="metric-unit"></span>
     </div>
   </section>
 
-  <!-- Live frequency trend chart -->
+  <!-- Confidence Indicator -->
+  <section class="card confidence-card">
+    <h2>Measurement Confidence</h2>
+    <div class="confidence-display">
+      <div class="confidence-gauge">
+        <div class="gauge-label">Overall</div>
+        <div class="gauge-bar"><div id="confidence-bar" class="gauge-fill"></div></div>
+        <div class="gauge-value" id="confidence-pct">—</div>
+      </div>
+      <div class="confidence-details">
+        <div class="confidence-item">
+          <span>Quality:</span>
+          <span id="quality-score" class="quality-badge">—</span>
+        </div>
+        <div class="confidence-item">
+          <span>Warnings:</span>
+          <span id="warning-count" class="warning-badge">0</span>
+        </div>
+      </div>
+    </div>
+    <div id="confidence-warnings" class="warnings-list"></div>
+  </section>
+
+  <!-- Baseline Comparison -->
+  <section class="card baseline-card">
+    <h2>Baseline Comparison</h2>
+    <div id="baseline-controls" class="baseline-controls">
+      <button id="create-baseline-btn" class="btn btn-primary">📌 Save Baseline</button>
+      <select id="baseline-select" class="baseline-select">
+        <option value="default">Default</option>
+      </select>
+    </div>
+    <div id="baseline-comparison" class="comparison-display"></div>
+  </section>
+
+  <!-- Damage Assessment -->
+  <section class="card damage-card">
+    <h2>Damage Hypothesis Assessment</h2>
+    <div class="damage-display">
+      <div class="damage-indicator">
+        <div class="indicator-label">Crack Likelihood</div>
+        <div class="indicator-bar">
+          <div id="damage-bar" class="indicator-fill"></div>
+        </div>
+        <div class="indicator-value" id="damage-likelihood">—</div>
+      </div>
+      <div class="damage-info">
+        <div class="info-item">
+          <span class="label">Type:</span>
+          <span id="damage-type" class="damage-type-badge">—</span>
+        </div>
+        <div class="info-item">
+          <span class="label">Alert:</span>
+          <span id="warning-level" class="alert-badge">—</span>
+        </div>
+      </div>
+    </div>
+    <div id="damage-recommendations" class="recommendations-list"></div>
+  </section>
+
+  <!-- Event Detection -->
+  <section class="card events-card">
+    <h2>Recent Events & Impacts</h2>
+    <div id="events-summary" class="events-summary"></div>
+    <div id="latest-impact" class="latest-impact"></div>
+  </section>
+
+  <!-- Live Frequency Trend -->
   <section class="card chart-card">
     <h2>Frequency Trend (last 30 s)</h2>
     <canvas id="freqChart"></canvas>
   </section>
 
-  <!-- Live displacement waveform -->
+  <!-- Live Displacement Waveform -->
   <section class="card chart-card">
     <h2>Live Displacement Waveform</h2>
     <canvas id="waveChart"></canvas>
   </section>
 
+  <!-- Spectral Peaks -->
+  <section class="card chart-card">
+    <h2>Top Spectral Peaks</h2>
+    <div id="peaks-table" class="peaks-display"></div>
+  </section>
+
 </main>
 
 <script>
-// ── Chart setup ──────────────────────────────────────────────
+// ────────────────────────────────────────────────────────────────────
+// Chart.js setup
+// ────────────────────────────────────────────────────────────────────
+
 const commonOpts = {
   animation: false,
   responsive: true,
@@ -108,7 +188,10 @@ const waveChart = new Chart(document.getElementById('waveChart'), {
   options: { ...commonOpts }
 });
 
-// ── Helpers ───────────────────────────────────────────────────
+// ────────────────────────────────────────────────────────────────────
+// Utility functions
+// ────────────────────────────────────────────────────────────────────
+
 function pushData(chart, label, value, maxPoints = 30) {
   chart.data.labels.push(label);
   chart.data.datasets[0].data.push(value);
@@ -119,20 +202,27 @@ function pushData(chart, label, value, maxPoints = 30) {
   chart.update('none');
 }
 
-function setStatus(status) {
-  const el = document.getElementById('status');
-  el.textContent = status;
-  el.className = 'metric-value';
-  if (status === 'Stable') el.classList.add('status-ok');
-  else if (status === 'Moderate Vibration') el.classList.add('status-warn');
-  else if (status === 'High Vibration') el.classList.add('status-danger');
-}
-
 function timestamp() {
   return new Date().toLocaleTimeString();
 }
 
-// ── Poll metrics every 1 s ────────────────────────────────────
+function confidenceToColor(conf) {
+  if (conf >= 0.85) return '#00ff00';
+  if (conf >= 0.70) return '#ffaa00';
+  return '#ff3333';
+}
+
+function damageToColor(likelihood) {
+  if (likelihood < 0.2) return '#00ff00';
+  if (likelihood < 0.4) return '#ffaa00';
+  if (likelihood < 0.65) return '#ff6600';
+  return '#ff0000';
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Update functions
+// ────────────────────────────────────────────────────────────────────
+
 async function updateMetrics() {
   try {
     const res = await fetch('/metrics');
@@ -142,9 +232,9 @@ async function updateMetrics() {
     document.getElementById('freq').textContent = d.frequency ?? '—';
     document.getElementById('damping').textContent = d.damping ?? '—';
     document.getElementById('rms').textContent = d.rms ?? '—';
-    setStatus(d.status ?? '—');
+    document.getElementById('status').textContent = d.status ?? '—';
 
-    pushData(freqChart, timestamp(), d.frequency, 30);
+    pushData(freqChart, timestamp(), d.frequency ?? 0, 30);
 
     document.getElementById('connection-status').textContent = 'Live';
     document.getElementById('connection-status').className = 'badge badge-ok';
@@ -154,7 +244,164 @@ async function updateMetrics() {
   }
 }
 
-// ── Poll waveform every 500 ms ────────────────────────────────
+async function updateConfidence() {
+  try {
+    const res = await fetch('/confidence');
+    if (!res.ok) return;
+    const data = await res.json();
+
+    const conf = data.overall_confidence ?? 0.5;
+    document.getElementById('confidence-pct').textContent = (conf * 100).toFixed(0) + '%';
+    
+    const confBar = document.getElementById('confidence-bar');
+    confBar.style.width = (conf * 100) + '%';
+    confBar.style.backgroundColor = confidenceToColor(conf);
+
+    document.getElementById('quality-score').textContent = data.quality_score ?? '—';
+    document.getElementById('quality-score').className = 'quality-badge ' + (data.quality_score || '');
+
+    document.getElementById('warning-count').textContent = data.num_warnings ?? 0;
+
+    // Update confidence percentages on metric cards
+    const freqConf = data.frequency_confidence ?? 0.5;
+    const dampConf = data.damping_confidence ?? 0.5;
+    const rmsConf = data.rms_confidence ?? 0.5;
+
+    document.getElementById('freq-conf').textContent = `(${(freqConf*100|0)}% conf)`;
+    document.getElementById('damp-conf').textContent = `(${(dampConf*100|0)}% conf)`;
+    document.getElementById('rms-conf').textContent = `(${(rmsConf*100|0)}% conf)`;
+
+    // Show warnings
+    const warningsList = document.getElementById('confidence-warnings');
+    if (data.warnings && data.warnings.length > 0) {
+      warningsList.innerHTML = data.warnings
+        .map(w => `<div class="warning-item">⚠ ${w}</div>`)
+        .join('');
+    } else {
+      warningsList.innerHTML = '';
+    }
+  } catch (e) {
+    console.error('Confidence fetch error:', e);
+  }
+}
+
+async function updateBaseline() {
+  try {
+    const res = await fetch('/baseline_comparison');
+    if (!res.ok) return;
+    const data = await res.json();
+
+    const severityColor = {
+      'normal': '#00ff00',
+      'warning': '#ffaa00',
+      'critical': '#ff0000'
+    }[data.severity] || '#999';
+
+    const devsHtml = Object.entries(data.deviations || {})
+      .map(([k, v]) => `<div class="dev-row">
+        <span class="dev-label">${k}:</span>
+        <span class="dev-value" style="color:${v > 0 ? '#ff7f50' : '#00ffff'}">${v > 0 ? '+' : ''}${v.toFixed(1)}%</span>
+      </div>`)
+      .join('');
+
+    const alertsHtml = (data.alerts || [])
+      .map(a => `<div class="alert-item">⚠ ${a}</div>`)
+      .join('');
+
+    document.getElementById('baseline-comparison').innerHTML = `
+      <div style="display:flex; justify-content:space-between; margin-bottom:12px;">
+        <div><span class="label">Severity:</span> <span style="color:${severityColor}; font-weight:bold;">${data.severity?.toUpperCase()}</span></div>
+        <div><span class="label">Max Dev:</span> <span>${data.max_deviation?.toFixed(1)}%</span></div>
+      </div>
+      <div class="deviations-grid">${devsHtml}</div>
+      <div class="alerts-list">${alertsHtml || '<div class="alert-item">✓ All metrics normal</div>'}</div>
+    `;
+  } catch (e) {
+    console.error('Baseline fetch error:', e);
+  }
+}
+
+async function updateDamage() {
+  try {
+    const res = await fetch('/damage_assessment');
+    if (!res.ok) return;
+    const data = await res.json();
+
+    const likelihood = data.crack_likelihood ?? 0;
+    document.getElementById('damage-likelihood').textContent = (likelihood * 100).toFixed(0) + '%';
+    
+    const dmgBar = document.getElementById('damage-bar');
+    dmgBar.style.width = (likelihood * 100) + '%';
+    dmgBar.style.backgroundColor = damageToColor(likelihood);
+
+    document.getElementById('damage-type').textContent = data.damage_type?.toUpperCase() || '—';
+    document.getElementById('damage-type').className = 'damage-type-badge ' + (data.damage_type || '');
+
+    const warnLevel = data.warning_level?.toUpperCase() || '—';
+    document.getElementById('warning-level').textContent = warnLevel;
+    document.getElementById('warning-level').className = 'alert-badge ' + (data.warning_level || '');
+
+    // Recommendations
+    const recsHtml = (data.recommendations || [])
+      .map(r => `<div class="rec-item">${r}</div>`)
+      .join('');
+    document.getElementById('damage-recommendations').innerHTML = recsHtml || '<div class="rec-item">✓ No damage indicators</div>';
+  } catch (e) {
+    console.error('Damage fetch error:', e);
+  }
+}
+
+async function updateEvents() {
+  try {
+    const res = await fetch('/events/recent');
+    if (!res.ok) return;
+    const data = await res.json();
+
+    const summary = `
+      <div class="event-stat">
+        <span class="stat-label">Recent Events:</span>
+        <span class="stat-value">${data.recent_events}</span>
+      </div>
+      <div class="event-stat">
+        <span class="stat-label">High Severity:</span>
+        <span class="stat-value" style="color:#ff0000;">${data.high_severity_count}</span>
+      </div>
+      <div class="event-stat">
+        <span class="stat-label">Medium Severity:</span>
+        <span class="stat-value" style="color:#ffaa00;">${data.medium_severity_count}</span>
+      </div>
+    `;
+
+    document.getElementById('events-summary').innerHTML = summary;
+
+    if (data.latest_event) {
+      const evt = data.latest_event;
+      const impactHtml = `
+        <div class="impact-card">
+          <div class="impact-title">Latest Impact Detected</div>
+          <div class="impact-detail">
+            <span>Magnitude:</span>
+            <span>${evt.peak_magnitude?.toFixed(2)} px</span>
+          </div>
+          <div class="impact-detail">
+            <span>Severity:</span>
+            <span style="color:${evt.severity === 'high' ? '#ff0000' : evt.severity === 'medium' ? '#ffaa00' : '#00ff00'}">${evt.severity?.toUpperCase()}</span>
+          </div>
+          <div class="impact-detail">
+            <span>Time:</span>
+            <span>${new Date(evt.timestamp).toLocaleTimeString()}</span>
+          </div>
+        </div>
+      `;
+      document.getElementById('latest-impact').innerHTML = impactHtml;
+    } else {
+      document.getElementById('latest-impact').innerHTML = '<div class="impact-card">No impacts detected</div>';
+    }
+  } catch (e) {
+    console.error('Events fetch error:', e);
+  }
+}
+
 async function updateWaveform() {
   try {
     const res = await fetch('/signal?n=60');
@@ -168,10 +415,106 @@ async function updateWaveform() {
   } catch (_) {}
 }
 
+async function updatePeaks() {
+  try {
+    const res = await fetch('/spectral_peaks');
+    if (!res.ok) return;
+    const data = await res.json();
+    const peaks = data.peaks || [];
+
+    const peaksHtml = peaks.length > 0
+      ? peaks.map((p, i) => `
+        <div class="peak-row">
+          <span class="peak-num">${i + 1}</span>
+          <span class="peak-freq">${p.frequency?.toFixed(2)} Hz</span>
+          <span class="peak-mag">${p.magnitude?.toFixed(3)}</span>
+          <span class="peak-q">Q=${p.q_factor?.toFixed(1)}</span>
+        </div>
+      `).join('')
+      : '<div class="peak-row">No spectral peaks detected</div>';
+
+    document.getElementById('peaks-table').innerHTML = `
+      <div class="peaks-header">
+        <span>#</span><span>Frequency</span><span>Magnitude</span><span>Q-Factor</span>
+      </div>
+      ${peaksHtml}
+    `;
+  } catch (e) {
+    console.error('Peaks fetch error:', e);
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Baseline management
+// ────────────────────────────────────────────────────────────────────
+
+async function updateBaselineSelect() {
+  try {
+    const res = await fetch('/baselines');
+    if (!res.ok) return;
+    const data = await res.json();
+    
+    const select = document.getElementById('baseline-select');
+    const current = select.value;
+    select.innerHTML = '';
+    
+    (data.baselines || ['default']).forEach(b => {
+      const opt = document.createElement('option');
+      opt.value = b;
+      opt.textContent = b;
+      select.appendChild(opt);
+    });
+    
+    select.value = current;
+  } catch (e) {
+    console.error('Baseline list error:', e);
+  }
+}
+
+document.getElementById('baseline-select').addEventListener('change', updateBaseline);
+
+document.getElementById('create-baseline-btn').addEventListener('click', async () => {
+  const name = prompt('Baseline name:', 'baseline_' + new Date().getHours() + '_' + new Date().getMinutes());
+  if (!name) return;
+  
+  try {
+    const res = await fetch(`/baselines/${name}`, { method: 'POST' });
+    if (res.ok) {
+      alert(`✓ Baseline '${name}' created`);
+      updateBaselineSelect();
+      document.getElementById('baseline-select').value = name;
+      updateBaseline();
+    } else {
+      alert('✗ Failed to create baseline');
+    }
+  } catch (e) {
+    console.error('Baseline create error:', e);
+  }
+});
+
+// ────────────────────────────────────────────────────────────────────
+// Polling intervals
+// ────────────────────────────────────────────────────────────────────
+
 setInterval(updateMetrics, 1000);
+setInterval(updateConfidence, 2000);
+setInterval(updateBaseline, 2000);
+setInterval(updateDamage, 2000);
+setInterval(updateEvents, 2000);
 setInterval(updateWaveform, 500);
+setInterval(updatePeaks, 3000);
+setInterval(updateBaselineSelect, 10000);
+
+// Initial update
 updateMetrics();
+updateConfidence();
+updateBaselineSelect();
+updateBaseline();
+updateDamage();
+updateEvents();
 updateWaveform();
+updatePeaks();
+
 </script>
 
 </body>
