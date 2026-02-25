@@ -1,58 +1,119 @@
-import cv2
 import numpy as np
+import cv2
 
-class VibrationTracker:
-    def __init__(self, video_path):
-        self.video_path = video_path
 
-        self.feature_params = dict(
-            maxCorners=400,
-            qualityLevel=0.01,
-            minDistance=7,
-            blockSize=7
-        )
+def pixel_to_mm(signal, scale_factor):
+    """
+    Convert pixel-displacement signal to physical units (mm).
 
-        self.lk_params = dict(
-            winSize=(21, 21),
-            maxLevel=3,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03)
-        )
+    Parameters
+    ----------
+    signal      : array-like
+    scale_factor : float  [mm / pixel]
 
-    def run(self):
-        cap = cv2.VideoCapture(self.video_path)
-        fps = cap.get(cv2.CAP_PROP_FPS)
+    Returns
+    -------
+    np.ndarray in mm
+    """
+    return np.asarray(signal, dtype=np.float64) * scale_factor
 
-        ret, old_frame = cap.read()
-        if not ret:
-            raise ValueError("Cannot load video.")
 
-        old_gray = cv2.cvtColor(old_frame, cv2.COLOR_BGR2GRAY)
-        p0 = cv2.goodFeaturesToTrack(old_gray, mask=None, **self.feature_params)
+def calibrate_from_ruler(frame, known_mm, axis="horizontal"):
+    """
+    Interactive calibration: user clicks two points on a ruler/reference
+    object of known physical length to derive a mm/pixel scale factor.
 
-        all_displacements = []
+    Parameters
+    ----------
+    frame    : np.ndarray  BGR image used for calibration
+    known_mm : float       physical distance between the two click points
+    axis     : str         'horizontal' | 'vertical' | 'both'
+                           determines which pixel component to use
 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+    Returns
+    -------
+    scale_factor : float  [mm / pixel]
+    """
+    points = []
 
-            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    def mouse_callback(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN and len(points) < 2:
+            points.append((x, y))
+            print(f"  Point {len(points)}: ({x}, {y})")
 
-            p1, st, err = cv2.calcOpticalFlowPyrLK(
-                old_gray, frame_gray, p0, None, **self.lk_params
-            )
+    clone = frame.copy()
+    cv2.namedWindow("Calibration — click two reference points", cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback("Calibration — click two reference points", mouse_callback)
 
-            if p1 is None:
-                break
+    print(f"[Calibration] Click two points {known_mm:.1f} mm apart.")
+    while len(points) < 2:
+        display = clone.copy()
+        for p in points:
+            cv2.circle(display, p, 5, (0, 255, 0), -1)
+        cv2.imshow("Calibration — click two reference points", display)
+        if cv2.waitKey(10) & 0xFF == 27:
+            break
 
-            good_new = p1[st == 1]
-            good_old = p0[st == 1]
+    cv2.destroyAllWindows()
 
-            frame_disp = good_new - good_old
-            all_displacements.append(frame_disp)
+    if len(points) < 2:
+        raise RuntimeError("Calibration cancelled — fewer than 2 points selected.")
 
-            old_gray = frame_gray.copy()
-            p0 = good_new.reshape(-1, 1, 2)
+    p1, p2 = np.array(points[0], dtype=float), np.array(points[1], dtype=float)
+    diff = p2 - p1
 
-        cap.release()
-        return all_displacements, fps
+    if axis == "horizontal":
+        pixel_dist = abs(diff[0])
+    elif axis == "vertical":
+        pixel_dist = abs(diff[1])
+    else:
+        pixel_dist = np.linalg.norm(diff)
+
+    if pixel_dist < 1:
+        raise ValueError("Points too close together for reliable calibration.")
+
+    scale = known_mm / pixel_dist
+    print(f"[Calibration] Scale factor: {scale:.5f} mm/pixel")
+    return scale
+
+
+def calibrate_from_chessboard(frame, square_size_mm=25.0, board_size=(9, 6)):
+    """
+    Automatic calibration using a printed chessboard.
+
+    Parameters
+    ----------
+    frame          : np.ndarray  BGR frame
+    square_size_mm : float  physical size of one chessboard square in mm
+    board_size     : tuple  (cols-1, rows-1) inner corners
+
+    Returns
+    -------
+    scale_factor : float  [mm / pixel]  (average across detected squares)
+    None if pattern not found.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    ret, corners = cv2.findChessboardCorners(gray, board_size)
+
+    if not ret:
+        print("[Calibration] Chessboard pattern not found.")
+        return None
+
+    corners = cv2.cornerSubPix(
+        gray, corners, (11, 11), (-1, -1),
+        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+    )
+
+    # Estimate pixel size of one square from horizontal neighbour spacing
+    cols = board_size[0]
+    spacings = []
+    for r in range(board_size[1]):
+        for c in range(cols - 1):
+            idx_a = r * cols + c
+            idx_b = r * cols + c + 1
+            spacings.append(np.linalg.norm(corners[idx_a][0] - corners[idx_b][0]))
+
+    pixel_per_square = float(np.median(spacings))
+    scale = square_size_mm / pixel_per_square
+    print(f"[Calibration] Chessboard scale: {scale:.5f} mm/pixel")
+    return scale
