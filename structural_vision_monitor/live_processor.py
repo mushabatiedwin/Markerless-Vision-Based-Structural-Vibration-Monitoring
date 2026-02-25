@@ -163,7 +163,17 @@ def _processing_loop(camera_index):
 
 
 def _get_structural_displacement(pts_old, pts_new):
-    """Homography-compensated vertical displacement (scalar)."""
+    """Homography-compensated vertical displacement (scalar).
+
+    cv2.calcOpticalFlowPyrLK returns points shaped (N, 1, 2).
+    After boolean indexing they become (N, 1, 2) or (N, 2) depending
+    on NumPy version, so we normalise to (N, 2) immediately.
+    """
+    # ---- Normalise shape to (N, 2) ----------------------------------------
+    pts_old = pts_old.reshape(-1, 2).astype(np.float32)
+    pts_new = pts_new.reshape(-1, 2).astype(np.float32)
+    # ------------------------------------------------------------------------
+
     if len(pts_old) >= 8:
         H, mask = cv2.findHomography(
             pts_old.reshape(-1, 1, 2),
@@ -171,13 +181,16 @@ def _get_structural_displacement(pts_old, pts_new):
             cv2.RANSAC, 3.0
         )
         if H is not None:
-            predicted = cv2.perspectiveTransform(pts_old.reshape(-1, 1, 2).astype(np.float32), H)
+            predicted = cv2.perspectiveTransform(
+                pts_old.reshape(-1, 1, 2), H
+            )
             structural = pts_new - predicted.reshape(-1, 2)
             return float(np.median(structural[:, 1]))
 
-    # Fallback: median subtraction
+    # Fallback: return median Y displacement after global-motion subtraction
     dy = pts_new[:, 1] - pts_old[:, 1]
-    return float(np.median(dy) - np.median(dy))   # = 0 when no structure motion
+    global_dy = np.median(dy)
+    return float(np.median(dy - global_dy))   # structural residual
 
 
 def _run_analysis(fps):
@@ -192,7 +205,6 @@ def _run_analysis(fps):
     signal = np.array(buf[-ANALYSIS_WINDOW:], dtype=np.float64)
 
     try:
-        # High-pass to remove slow drift
         from signal_analysis import highpass_filter
         signal = highpass_filter(signal, fps, cutoff=0.5)
     except Exception:
