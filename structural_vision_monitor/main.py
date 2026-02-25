@@ -1,243 +1,250 @@
 """
-Live Processor — Real-time webcam vibration analysis
+Structural Vision Monitor — Offline Analysis Pipeline
 ======================================================
-Captures frames, tracks features, and computes vibration metrics
-in a background thread. Exposes thread-safe getters for the API.
+Processes a pre-recorded video to extract vibration displacement,
+dominant frequencies, and damping ratio.
+
+Usage
+-----
+    python main.py [--video PATH] [--cutoff HZ] [--scale MM_PER_PIXEL]
+                   [--start FRAME] [--end FRAME] [--method log_decrement|envelope]
+
+Output
+------
+    results/
+        displacement.png   — filtered displacement time-series
+        fft.png            — FFT frequency spectrum
+        psd.png            — Welch PSD (more reliable for short signals)
+        report.txt         — summary of key metrics
 """
 
-import threading
-import time
-import cv2
+import os
+import argparse
 import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 
+from feature_tracker import VibrationTracker
+from motion_compensation import compensate_motion
 from signal_analysis import (
-    compute_welch_psd,
+    smooth_signal,
     compute_fft,
-    dominant_frequency,
-    estimate_damping,
+    compute_welch_psd,
     highpass_filter,
+    bandpass_filter,
+    dominant_frequency,
+    top_n_frequencies,
+    estimate_damping,
+    signal_snr,
     rms_displacement,
 )
-
-# ---------------------------------------------------------------------------
-# Shared state (protected by _lock)
-# ---------------------------------------------------------------------------
-
-_lock = threading.Lock()
-
-_latest_metrics = {
-    "frequency": 0.0,
-    "damping": 0.0,
-    "rms": 0.0,
-    "status": "Initializing",
-    "signal_buffer": [],   # last N samples for live chart
-}
-
-_latest_frame = None          # annotated BGR frame
-_signal_buffer = []           # raw pixel-displacement history
-_running = False
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-FPS = 30
-BUFFER_SIZE = 300             # ~10 s at 30 fps
-ANALYSIS_WINDOW = 150         # frames used for FFT / damping
-REINIT_EVERY = 90             # re-detect features every N frames
-
-FEATURE_PARAMS = dict(maxCorners=200, qualityLevel=0.01, minDistance=7, blockSize=7)
-LK_PARAMS = dict(
-    winSize=(21, 21),
-    maxLevel=3,
-    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
-)
+from calibration import pixel_to_mm
+from utils import save_plot
 
 
-# ---------------------------------------------------------------------------
-# Background processing thread
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
 
-def start_processing(camera_index=0):
-    global _running
-    if _running:
-        return
-    _running = True
-    t = threading.Thread(target=_processing_loop, args=(camera_index,), daemon=True)
-    t.start()
-
-
-def _processing_loop(camera_index):
-    global _latest_frame, _signal_buffer, _latest_metrics
-
-    cap = cv2.VideoCapture(camera_index)
-    if not cap.isOpened():
-        with _lock:
-            _latest_metrics["status"] = "Camera error"
-        return
-
-    actual_fps = cap.get(cv2.CAP_PROP_FPS)
-    fps = actual_fps if actual_fps > 5 else FPS
-
-    ret, first_frame = cap.read()
-    if not ret:
-        with _lock:
-            _latest_metrics["status"] = "Camera read error"
-        return
-
-    prev_gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
-    prev_pts = cv2.goodFeaturesToTrack(prev_gray, mask=None, **FEATURE_PARAMS)
-
-    frame_idx = 0
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            time.sleep(0.1)
-            continue
-
-        frame_idx += 1
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # --- Optical flow ---
-        next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
-            prev_gray, gray, prev_pts, None, **LK_PARAMS
-        )
-
-        annotated = frame.copy()
-
-        if next_pts is not None and np.sum(status) >= 4:
-            good_new = next_pts[status.ravel() == 1]
-            good_old = prev_pts[status.ravel() == 1]
-
-            # Homography camera compensation
-            displacement_y = _get_structural_displacement(good_old, good_new)
-
-            with _lock:
-                _signal_buffer.append(displacement_y)
-                if len(_signal_buffer) > BUFFER_SIZE:
-                    _signal_buffer.pop(0)
-
-            # Draw tracked points
-            for pt in good_new.reshape(-1, 2):
-                cv2.circle(annotated, tuple(pt.astype(int).tolist()), 2, (0, 255, 0), -1)
-
-            prev_gray = gray.copy()
-            prev_pts = good_new.reshape(-1, 1, 2)
-        else:
-            # Re-initialize
-            prev_pts = cv2.goodFeaturesToTrack(gray, mask=None, **FEATURE_PARAMS)
-            prev_gray = gray.copy()
-
-        # Periodic re-init
-        if frame_idx % REINIT_EVERY == 0:
-            prev_pts = cv2.goodFeaturesToTrack(gray, mask=None, **FEATURE_PARAMS)
-
-        # --- Overlay metrics on frame ---
-        with _lock:
-            m = _latest_metrics.copy()
-
-        status_color = {
-            "Stable": (0, 200, 0),
-            "Moderate Vibration": (0, 165, 255),
-            "High Vibration": (0, 0, 255),
-        }.get(m["status"], (200, 200, 200))
-
-        cv2.putText(annotated, f"Freq: {m['frequency']:.2f} Hz",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-        cv2.putText(annotated, f"Damp: {m['damping']:.4f}",
-                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-        cv2.putText(annotated, m["status"],
-                    (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
-
-        with _lock:
-            _latest_frame = annotated
-
-        # --- Analysis (every ~1 s) ---
-        if frame_idx % int(fps) == 0:
-            _run_analysis(fps)
-
-        time.sleep(max(0, 1.0 / fps - 0.002))
-
-    cap.release()
+def parse_args():
+    p = argparse.ArgumentParser(description="Structural Vibration Analysis")
+    p.add_argument("--video",   default="data/test_video.mp4")
+    p.add_argument("--cutoff",  type=float, default=1.0,  help="High-pass cutoff Hz")
+    p.add_argument("--scale",   type=float, default=1.0,  help="mm per pixel")
+    p.add_argument("--start",   type=int,   default=None, help="Damping segment start frame")
+    p.add_argument("--end",     type=int,   default=None, help="Damping segment end frame")
+    p.add_argument("--method",  default="log_decrement",  help="Damping method")
+    p.add_argument("--results", default="results")
+    return p.parse_args()
 
 
-def _get_structural_displacement(pts_old, pts_new):
-    """Homography-compensated vertical displacement (scalar)."""
-    if len(pts_old) >= 8:
-        H, mask = cv2.findHomography(
-            pts_old.reshape(-1, 1, 2),
-            pts_new.reshape(-1, 1, 2),
-            cv2.RANSAC, 3.0
-        )
-        if H is not None:
-            predicted = cv2.perspectiveTransform(pts_old.reshape(-1, 1, 2).astype(np.float32), H)
-            structural = pts_new - predicted.reshape(-1, 2)
-            return float(np.median(structural[:, 1]))
+# --------------------------------------------------------------------------
+# Plotting helpers
+# --------------------------------------------------------------------------
 
-    # Fallback: median subtraction
-    dy = pts_new[:, 1] - pts_old[:, 1]
-    return float(np.median(dy) - np.median(dy))   # = 0 when no structure motion
-
-
-def _run_analysis(fps):
-    global _latest_metrics
-
-    with _lock:
-        buf = list(_signal_buffer)
-
-    if len(buf) < ANALYSIS_WINDOW:
-        return
-
-    signal = np.array(buf[-ANALYSIS_WINDOW:], dtype=np.float64)
-
-    try:
-        # High-pass to remove slow drift
-        from signal_analysis import highpass_filter
-        signal = highpass_filter(signal, fps, cutoff=0.5)
-    except Exception:
-        pass
-
-    # Welch PSD (more reliable than raw FFT for live data)
-    try:
-        f_psd, psd = compute_welch_psd(signal, fps)
-        dom_freq_psd, _ = dominant_frequency(f_psd, psd, min_hz=0.3)
-    except Exception:
-        dom_freq_psd = 0.0
-
-    # Damping
-    damping = estimate_damping(signal, fps=fps, method="log_decrement")
-
-    # RMS
-    rms = rms_displacement(signal)
-
-    # Status label
-    if dom_freq_psd < 2:
-        status_label = "Stable"
-    elif dom_freq_psd < 8:
-        status_label = "Moderate Vibration"
-    else:
-        status_label = "High Vibration"
-
-    with _lock:
-        _latest_metrics = {
-            "frequency": round(float(dom_freq_psd), 2),
-            "damping": round(float(damping), 4) if damping else 0.0,
-            "rms": round(float(rms), 4),
-            "status": status_label,
-            "signal_buffer": signal[-60:].tolist(),   # last 60 pts for live chart
-        }
+def plot_displacement(signal, fps, results_dir, title="Filtered Displacement Signal"):
+    t = np.arange(len(signal)) / fps
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(t, signal, linewidth=0.8, color="#1f77b4")
+    ax.set_title(title, fontsize=13)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Displacement (mm)")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    path = os.path.join(results_dir, "displacement.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved: {path}")
 
 
-# ---------------------------------------------------------------------------
-# Public getters (thread-safe)
-# ---------------------------------------------------------------------------
+def plot_fft(freqs, mags, dom_freq, dom_mag, results_dir, max_hz=25):
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(freqs, mags, linewidth=0.9, color="#1f77b4", label="FFT magnitude")
+    ax.scatter([dom_freq], [dom_mag], color="red", zorder=5,
+               label=f"Peak: {dom_freq:.2f} Hz")
+    ax.set_title("Frequency Spectrum (FFT)", fontsize=13)
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Magnitude")
+    ax.set_xlim(0, max_hz)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    path = os.path.join(results_dir, "fft.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved: {path}")
 
-def get_latest_metrics():
-    with _lock:
-        return dict(_latest_metrics)
+
+def plot_psd(freqs, psd, results_dir, max_hz=25):
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.semilogy(freqs, psd, linewidth=0.9, color="#ff7f0e")
+    ax.set_title("Power Spectral Density (Welch)", fontsize=13)
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("PSD")
+    ax.set_xlim(0, max_hz)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    path = os.path.join(results_dir, "psd.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved: {path}")
 
 
-def get_latest_frame():
-    with _lock:
-        return _latest_frame
+def plot_overview(t, signal, freqs, mags, psd_f, psd, dom_freq, dom_mag, results_dir):
+    """4-panel summary figure."""
+    fig = plt.figure(figsize=(14, 8))
+    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.45, wspace=0.35)
+
+    ax1 = fig.add_subplot(gs[0, :])
+    ax1.plot(t, signal, linewidth=0.7)
+    ax1.set_title("Filtered Displacement (Time Domain)")
+    ax1.set_xlabel("Time (s)")
+    ax1.set_ylabel("Displacement (mm)")
+    ax1.grid(True, alpha=0.3)
+
+    ax2 = fig.add_subplot(gs[1, 0])
+    ax2.plot(freqs, mags, linewidth=0.8)
+    ax2.scatter([dom_freq], [dom_mag], color="red", zorder=5, label=f"{dom_freq:.2f} Hz")
+    ax2.set_title("FFT Spectrum")
+    ax2.set_xlabel("Frequency (Hz)")
+    ax2.set_ylabel("Magnitude")
+    ax2.set_xlim(0, 25)
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    ax3 = fig.add_subplot(gs[1, 1])
+    ax3.semilogy(psd_f, psd, linewidth=0.8, color="orange")
+    ax3.set_title("Welch PSD")
+    ax3.set_xlabel("Frequency (Hz)")
+    ax3.set_ylabel("PSD")
+    ax3.set_xlim(0, 25)
+    ax3.grid(True, alpha=0.3)
+
+    fig.suptitle("Structural Vibration Monitor — Summary", fontsize=14, y=1.01)
+    path = os.path.join(results_dir, "overview.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+# --------------------------------------------------------------------------
+# Main pipeline
+# --------------------------------------------------------------------------
+
+def main():
+    args = parse_args()
+    results_dir = args.results
+    os.makedirs(results_dir, exist_ok=True)
+
+    print("\n=== Structural Vision Monitor ===\n")
+
+    # --- 1. Track features ---
+    print("[1/6] Tracking features...")
+    tracker = VibrationTracker(args.video)
+    displacements, fps = tracker.run()
+    print(f"      Video: {len(displacements)} frames @ {fps:.1f} fps")
+
+    # --- 2. Aggregate to scalar signal ---
+    print("[2/6] Aggregating displacement signal...")
+    raw_signal = compensate_motion(displacements, axis="y")
+
+    # --- 3. Filter ---
+    print("[3/6] Filtering (high-pass)...")
+    smoothed = smooth_signal(raw_signal, window=5)
+    filtered = highpass_filter(smoothed, fps, cutoff=args.cutoff)
+
+    # --- 4. Calibrate ---
+    print("[4/6] Calibrating to physical units...")
+    physical_signal = pixel_to_mm(filtered, args.scale)
+
+    # --- 5. Frequency analysis ---
+    print("[5/6] Frequency analysis...")
+    freqs_fft, mags_fft = compute_fft(physical_signal, fps)
+    dom_freq, dom_mag = dominant_frequency(freqs_fft, mags_fft)
+    top_freqs = top_n_frequencies(freqs_fft, mags_fft, n=5)
+
+    freqs_psd, psd = compute_welch_psd(physical_signal, fps)
+    dom_freq_psd, _ = dominant_frequency(freqs_psd, psd)
+
+    snr = signal_snr(physical_signal)
+    rms = rms_displacement(physical_signal)
+
+    # --- 6. Damping estimation ---
+    print("[6/6] Damping estimation...")
+    # Auto-detect ringing segment or use user-specified
+    start_f = args.start
+    end_f   = args.end
+
+    # Fallback: find the frame with max absolute amplitude as ringing start
+    if start_f is None:
+        peak_frame = int(np.argmax(np.abs(physical_signal)))
+        start_f = max(0, peak_frame)
+        end_f   = min(len(physical_signal), peak_frame + int(fps * 3))  # 3s window
+
+    ringing = physical_signal[start_f:end_f]
+    damping = estimate_damping(ringing, fps=fps, method=args.method)
+
+    # --- Print summary ---
+    t = np.arange(len(physical_signal)) / fps
+
+    print("\n─── Results ───────────────────────────────")
+    print(f"  Dominant frequency (FFT)  : {dom_freq:.3f} Hz")
+    print(f"  Dominant frequency (Welch): {dom_freq_psd:.3f} Hz")
+    print(f"  Top 5 spectral peaks      : {[(round(f,2), round(m,4)) for f,m in top_freqs]}")
+    print(f"  Damping ratio (ζ)         : {damping:.4f}" if damping else "  Damping ratio (ζ)         : N/A")
+    print(f"  RMS displacement          : {rms:.4f} mm")
+    print(f"  Estimated SNR             : {snr:.1f} dB")
+    print(f"  Analysis window           : frames {start_f}–{end_f}")
+    print("─────────────────────────────────────────\n")
+
+    # --- Plots ---
+    print("Saving plots...")
+    plot_displacement(physical_signal, fps, results_dir)
+    plot_fft(freqs_fft, mags_fft, dom_freq, dom_mag, results_dir)
+    plot_psd(freqs_psd, psd, results_dir)
+    plot_overview(t, physical_signal, freqs_fft, mags_fft, freqs_psd, psd,
+                  dom_freq, dom_mag, results_dir)
+
+    # --- Text report ---
+    report_path = os.path.join(results_dir, "report.txt")
+    with open(report_path, "w") as f:
+        f.write("Structural Vibration Monitor — Analysis Report\n")
+        f.write("=" * 50 + "\n\n")
+        f.write(f"Video              : {args.video}\n")
+        f.write(f"Frames             : {len(displacements)}\n")
+        f.write(f"FPS                : {fps:.2f}\n")
+        f.write(f"Scale factor       : {args.scale} mm/px\n")
+        f.write(f"High-pass cutoff   : {args.cutoff} Hz\n\n")
+        f.write(f"Dominant freq (FFT)  : {dom_freq:.3f} Hz\n")
+        f.write(f"Dominant freq (Welch): {dom_freq_psd:.3f} Hz\n")
+        f.write(f"Top spectral peaks   : {top_freqs}\n")
+        f.write(f"Damping ratio (zeta) : {damping:.4f}\n" if damping else "Damping ratio : N/A\n")
+        f.write(f"RMS displacement     : {rms:.4f} mm\n")
+        f.write(f"SNR estimate         : {snr:.1f} dB\n")
+    print(f"  Saved: {report_path}")
+
+    print("\n✓ Processing complete. Results saved to:", results_dir)
+
+
+if __name__ == "__main__":
+    main()
