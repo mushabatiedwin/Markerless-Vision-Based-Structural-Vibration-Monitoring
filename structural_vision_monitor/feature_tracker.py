@@ -1,119 +1,164 @@
-import numpy as np
 import cv2
+import numpy as np
 
 
-def pixel_to_mm(signal, scale_factor):
+class VibrationTracker:
     """
-    Convert pixel-displacement signal to physical units (mm).
-
-    Parameters
-    ----------
-    signal      : array-like
-    scale_factor : float  [mm / pixel]
-
-    Returns
-    -------
-    np.ndarray in mm
+    Markerless optical-flow vibration tracker with:
+    - Shi-Tomasi feature detection
+    - Lucas-Kanade sparse optical flow
+    - Homography-based global camera motion removal
+    - Optional ROI for structure isolation
+    - Feature reinitialization on track loss
     """
-    return np.asarray(signal, dtype=np.float64) * scale_factor
 
+    def __init__(self, video_path, roi=None, reinit_interval=60):
+        """
+        Parameters
+        ----------
+        video_path : str
+            Path to input video file.
+        roi : tuple or None
+            (x, y, w, h) pixel region defining the structure of interest.
+            If None, the full frame is used (no separation of background).
+        reinit_interval : int
+            Re-detect features every N frames to recover from drift / track loss.
+        """
+        self.video_path = video_path
+        self.roi = roi
+        self.reinit_interval = reinit_interval
 
-def calibrate_from_ruler(frame, known_mm, axis="horizontal"):
-    """
-    Interactive calibration: user clicks two points on a ruler/reference
-    object of known physical length to derive a mm/pixel scale factor.
+        self.feature_params = dict(
+            maxCorners=400,
+            qualityLevel=0.01,
+            minDistance=7,
+            blockSize=7,
+        )
 
-    Parameters
-    ----------
-    frame    : np.ndarray  BGR image used for calibration
-    known_mm : float       physical distance between the two click points
-    axis     : str         'horizontal' | 'vertical' | 'both'
-                           determines which pixel component to use
+        self.lk_params = dict(
+            winSize=(21, 21),
+            maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+        )
 
-    Returns
-    -------
-    scale_factor : float  [mm / pixel]
-    """
-    points = []
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-    def mouse_callback(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN and len(points) < 2:
-            points.append((x, y))
-            print(f"  Point {len(points)}: ({x}, {y})")
+    def run(self):
+        """
+        Track features across every frame and return per-frame displacement lists.
 
-    clone = frame.copy()
-    cv2.namedWindow("Calibration — click two reference points", cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback("Calibration — click two reference points", mouse_callback)
+        Returns
+        -------
+        all_displacements : list of np.ndarray  shape (N_i, 2)
+            Raw (dx, dy) vectors for each tracked feature in frame i.
+        fps : float
+        """
+        cap = cv2.VideoCapture(self.video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Cannot open video: {self.video_path}")
 
-    print(f"[Calibration] Click two points {known_mm:.1f} mm apart.")
-    while len(points) < 2:
-        display = clone.copy()
-        for p in points:
-            cv2.circle(display, p, 5, (0, 255, 0), -1)
-        cv2.imshow("Calibration — click two reference points", display)
-        if cv2.waitKey(10) & 0xFF == 27:
-            break
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0:
+            fps = 30.0  # safe fallback
 
-    cv2.destroyAllWindows()
+        ret, old_frame = cap.read()
+        if not ret:
+            raise ValueError("Cannot read first frame.")
 
-    if len(points) < 2:
-        raise RuntimeError("Calibration cancelled — fewer than 2 points selected.")
+        old_gray = cv2.cvtColor(old_frame, cv2.COLOR_BGR2GRAY)
+        p0 = self._detect_features(old_gray)
+        origin = p0.copy()           # anchor for absolute displacement
 
-    p1, p2 = np.array(points[0], dtype=float), np.array(points[1], dtype=float)
-    diff = p2 - p1
+        all_displacements = []
+        frame_idx = 0
 
-    if axis == "horizontal":
-        pixel_dist = abs(diff[0])
-    elif axis == "vertical":
-        pixel_dist = abs(diff[1])
-    else:
-        pixel_dist = np.linalg.norm(diff)
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_idx += 1
 
-    if pixel_dist < 1:
-        raise ValueError("Points too close together for reliable calibration.")
+            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    scale = known_mm / pixel_dist
-    print(f"[Calibration] Scale factor: {scale:.5f} mm/pixel")
-    return scale
+            p1, st, err = cv2.calcOpticalFlowPyrLK(
+                old_gray, frame_gray, p0, None, **self.lk_params
+            )
 
+            if p1 is None or np.sum(st) < 8:
+                # Re-initialize on catastrophic track failure
+                p0 = self._detect_features(frame_gray)
+                origin = p0.copy()
+                old_gray = frame_gray.copy()
+                all_displacements.append(np.zeros((1, 2), dtype=np.float32))
+                continue
 
-def calibrate_from_chessboard(frame, square_size_mm=25.0, board_size=(9, 6)):
-    """
-    Automatic calibration using a printed chessboard.
+            good_new = p1[st.ravel() == 1]
+            good_old = p0[st.ravel() == 1]
 
-    Parameters
-    ----------
-    frame          : np.ndarray  BGR frame
-    square_size_mm : float  physical size of one chessboard square in mm
-    board_size     : tuple  (cols-1, rows-1) inner corners
+            # --- Homography-based camera motion removal ---
+            frame_disp = self._compensate_homography(good_old, good_new, frame_gray.shape)
 
-    Returns
-    -------
-    scale_factor : float  [mm / pixel]  (average across detected squares)
-    None if pattern not found.
-    """
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
-    ret, corners = cv2.findChessboardCorners(gray, board_size)
+            all_displacements.append(frame_disp)
 
-    if not ret:
-        print("[Calibration] Chessboard pattern not found.")
-        return None
+            old_gray = frame_gray.copy()
+            p0 = good_new.reshape(-1, 1, 2)
 
-    corners = cv2.cornerSubPix(
-        gray, corners, (11, 11), (-1, -1),
-        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-    )
+            # Periodic feature re-initialization to fight drift
+            if frame_idx % self.reinit_interval == 0:
+                new_pts = self._detect_features(frame_gray)
+                p0 = new_pts
+                origin = p0.copy()
 
-    # Estimate pixel size of one square from horizontal neighbour spacing
-    cols = board_size[0]
-    spacings = []
-    for r in range(board_size[1]):
-        for c in range(cols - 1):
-            idx_a = r * cols + c
-            idx_b = r * cols + c + 1
-            spacings.append(np.linalg.norm(corners[idx_a][0] - corners[idx_b][0]))
+        cap.release()
+        return all_displacements, fps
 
-    pixel_per_square = float(np.median(spacings))
-    scale = square_size_mm / pixel_per_square
-    print(f"[Calibration] Chessboard scale: {scale:.5f} mm/pixel")
-    return scale
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _detect_features(self, gray):
+        mask = None
+        if self.roi is not None:
+            x, y, w, h = self.roi
+            mask = np.zeros_like(gray)
+            mask[y : y + h, x : x + w] = 255
+        pts = cv2.goodFeaturesToTrack(gray, mask=mask, **self.feature_params)
+        if pts is None:
+            raise RuntimeError("No features detected. Check video content or ROI.")
+        return pts
+
+    def _compensate_homography(self, pts_old, pts_new, frame_shape):
+        """
+        Estimate global camera motion via homography and subtract it from
+        per-feature displacements so only structural motion remains.
+
+        Falls back to median subtraction when homography cannot be estimated.
+        """
+        if len(pts_old) < 8:
+            # Not enough points for homography → median fallback
+            raw = pts_new - pts_old
+            cam_motion = np.median(raw, axis=0)
+            return raw - cam_motion
+
+        H, inlier_mask = cv2.findHomography(
+            pts_old.reshape(-1, 1, 2),
+            pts_new.reshape(-1, 1, 2),
+            cv2.RANSAC,
+            ransacReprojThreshold=3.0,
+        )
+
+        if H is None:
+            raw = pts_new - pts_old
+            cam_motion = np.median(raw, axis=0)
+            return raw - cam_motion
+
+        # Project old points through H → predicted new positions if camera-only motion
+        h, w = frame_shape
+        pts_old_h = pts_old.reshape(-1, 1, 2).astype(np.float32)
+        predicted = cv2.perspectiveTransform(pts_old_h, H).reshape(-1, 2)
+
+        # Residual after removing camera motion = structural displacement
+        structural = pts_new - predicted
+        return structural.astype(np.float32)
