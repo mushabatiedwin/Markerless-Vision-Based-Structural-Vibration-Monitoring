@@ -1,46 +1,47 @@
 import numpy as np
 
-def compensate_motion(displacements, roi=None):
-    corrected_signal = []
+
+def compensate_motion(displacements, axis="y"):
+    """
+    Aggregate per-frame feature displacement vectors into a scalar signal.
+
+    Since homography compensation is already applied inside VibrationTracker,
+    this module now focuses on robust outlier-resistant aggregation.
+
+    Parameters
+    ----------
+    displacements : list of np.ndarray  shape (N_i, 2)
+        Output from VibrationTracker.run().
+    axis : str
+        'y' for vertical vibration, 'x' for horizontal, 'magnitude' for L2 norm.
+
+    Returns
+    -------
+    signal : np.ndarray  shape (T,)
+        Scalar displacement per frame.
+    """
+    axis_idx = {"x": 0, "y": 1}.get(axis, 1)
+    signal = []
 
     for frame_disp in displacements:
-        if len(frame_disp) == 0:
-            corrected_signal.append(0)
+        if frame_disp is None or len(frame_disp) == 0:
+            signal.append(0.0)
             continue
 
-        structure_disp = []
-        background_disp = []
-
-        for dx, dy in frame_disp:
-            if roi is not None:
-                x, y, w, h = roi
-                # NOTE: You must ensure ROI selection matches feature coordinates.
-                # For now, assume ROI applied externally if needed.
-                structure_disp.append([dx, dy])
-            else:
-                structure_disp.append([dx, dy])
-
-        structure_disp = np.array(structure_disp)
-
-        if len(background_disp) > 0:
-            camera_motion = np.median(background_disp, axis=0)
+        if axis == "magnitude":
+            vals = np.linalg.norm(frame_disp, axis=1)
         else:
-            camera_motion = np.array([0, 0])
+            vals = frame_disp[:, axis_idx]
 
-        corrected = structure_disp - camera_motion
-        y_vals = corrected[:, 1]
+        # Median + MAD outlier rejection (robust to point-tracking noise)
+        median = np.median(vals)
+        mad = np.median(np.abs(vals - median))
 
-        median = np.median(y_vals)
-        mad = np.median(np.abs(y_vals - median))
-
-        if mad == 0:
-            avg_y = median
+        if mad < 1e-9:
+            signal.append(float(median))
         else:
-            mask = np.abs(y_vals - median) < 3 * mad
-            filtered = y_vals[mask]
-            avg_y = np.mean(filtered) if len(filtered) > 0 else median
+            inlier_mask = np.abs(vals - median) < 3.0 * mad
+            clean = vals[inlier_mask]
+            signal.append(float(np.mean(clean)) if len(clean) > 0 else float(median))
 
-
-        corrected_signal.append(avg_y)
-
-    return np.array(corrected_signal)
+    return np.array(signal, dtype=np.float64)
